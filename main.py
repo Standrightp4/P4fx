@@ -8,17 +8,17 @@ from flask import Flask
 from threading import Thread
 
 # ======================
-# 🔐 TELEGRAM CONFIG
+# TELEGRAM
 # ======================
 TOKEN = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-def send_signal(message):
+def send_signal(msg):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    requests.post(url, data={"chat_id": CHAT_ID, "text": message})
+    requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
 
 # ======================
-# 🌐 KEEP ALIVE (RAILWAY SAFE)
+# KEEP ALIVE (RAILWAY)
 # ======================
 app = Flask('')
 
@@ -27,12 +27,16 @@ def home():
     return "Bot running"
 
 def run_web():
-    app.run(host='0.0.0.0', port=8080)
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
 
-Thread(target=run_web).start()
+def keep_alive():
+    Thread(target=run_web).start()
+
+keep_alive()
 
 # ======================
-# 📊 DERIV DATA
+# DATA
 # ======================
 def get_market_data(symbol, granularity):
     ws = websocket.create_connection("wss://ws.derivws.com/websockets/v3")
@@ -59,39 +63,33 @@ def get_market_data(symbol, granularity):
     return df
 
 # ======================
-# 📈 INDICATORS (BFA)
+# INDICATORS
 # ======================
 def calculate_indicators(df):
     df['ema'] = df['close'].ewm(span=10).mean()
     df['sma'] = df['close'].rolling(10).mean()
-
     df['mbb'] = df['close'].rolling(20).mean()
     df['std'] = df['close'].rolling(20).std()
     df['upper'] = df['mbb'] + (2 * df['std'])
     df['lower'] = df['mbb'] - (2 * df['std'])
-
     return df
 
 def get_slope(series):
     return series.iloc[-1] - series.iloc[-2]
 
 # ======================
-# 📉 PRICE ACTION
+# PRICE ACTION
 # ======================
 def get_structure(df):
-    highs = df['high']
-    lows = df['low']
-
-    if highs.iloc[-1] > highs.iloc[-2] and lows.iloc[-1] > lows.iloc[-2]:
+    if df['high'].iloc[-1] > df['high'].iloc[-2] and df['low'].iloc[-1] > df['low'].iloc[-2]:
         return "UP"
-    elif highs.iloc[-1] < highs.iloc[-2] and lows.iloc[-1] < lows.iloc[-2]:
+    elif df['high'].iloc[-1] < df['high'].iloc[-2] and df['low'].iloc[-1] < df['low'].iloc[-2]:
         return "DOWN"
     return "RANGE"
 
 def trendline_break(df):
     recent_high = df['high'].iloc[-5:-1].max()
     recent_low = df['low'].iloc[-5:-1].min()
-
     last_close = df['close'].iloc[-1]
 
     if last_close > recent_high:
@@ -132,26 +130,14 @@ def is_fakeout(df):
         (prev['close'] < prev['open'] and last['close'] > last['open'])
     )
 
-def liquidity_sweep(df):
-    prev_high = df['high'].iloc[-3]
-    prev_low = df['low'].iloc[-3]
-    last = df.iloc[-1]
-
-    if last['high'] > prev_high and last['close'] < prev_high:
-        return "SWEEP_HIGH"
-    elif last['low'] < prev_low and last['close'] > prev_low:
-        return "SWEEP_LOW"
-    return "NONE"
-
 # ======================
-# 🎯 STRATEGY
+# STRATEGY
 # ======================
 last_signal = None
 
 def strategy(symbol):
     global last_signal
 
-    # TIMEFRAMES
     m1 = get_market_data(symbol, 60)
     m5 = get_market_data(symbol, 300)
     m15 = get_market_data(symbol, 900)
@@ -160,7 +146,6 @@ def strategy(symbol):
     h4 = get_market_data(symbol, 14400)
     d1 = get_market_data(symbol, 86400)
 
-    # STRUCTURE
     trend_m1 = get_structure(m1)
     trend_m5 = get_structure(m5)
     trend_m15 = get_structure(m15)
@@ -177,7 +162,6 @@ def strategy(symbol):
         if htf_confirm >= 1:
 
             df = calculate_indicators(m15)
-
             last = df.iloc[-1]
 
             ema_slope = get_slope(df['ema'])
@@ -188,30 +172,75 @@ def strategy(symbol):
             retest = retest_zone(df)
             confirm = confirmation_candle(df)
             fake = is_fakeout(df)
-            sweep = liquidity_sweep(df)
 
             # BUY
             if (
-                direction == "UP" and
-                last['ema'] > last['sma'] and
-                last['ema'] > last['mbb'] and
-                ema_slope > 0 and sma_slope > 0 and mbb_slope > 0 and
-                breakout == "BREAK_UP" and
-                retest == "RETEST_HIGH" and
-                confirm == "BUY" and
-                not fake
+                direction == "UP"
+                and last['ema'] > last['sma']
+                and last['ema'] > last['mbb']
+                and ema_slope > 0
+                and sma_slope > 0
+                and mbb_slope > 0
+                and breakout == "BREAK_UP"
+                and retest == "RETEST_HIGH"
+                and confirm == "BUY"
+                and not fake
             ):
                 entry = last['close']
                 sl = df['low'].iloc[-3]
                 tp = df['upper'].iloc[-1]
+                rr = round((tp - entry) / (entry - sl), 2)
+
+                reason = f"LTF: {trend_m1}/{trend_m5}/{trend_m15}\nHTF: {htf_confirm}\nBreakout+Retest confirmed"
 
                 if last_signal != "BUY":
-                    send_signal(f"BUY\nEntry:{entry}\nSL:{sl}\nTP:{tp}")
+                    send_signal(f"📈 BUY\nEntry:{entry}\nSL:{sl}\nTP:{tp}\nRR:{rr}\n\n{reason}")
                     last_signal = "BUY"
 
             # SELL
             elif (
-                direction == "DOWN" and
-                last['ema'] < last['sma'] and
-                last['ema'] < last['mbb'] and
-                ema_slope < 0 and sma_slope <
+                direction == "DOWN"
+                and last['ema'] < last['sma']
+                and last['ema'] < last['mbb']
+                and ema_slope < 0
+                and sma_slope < 0
+                and mbb_slope < 0
+                and breakout == "BREAK_DOWN"
+                and retest == "RETEST_LOW"
+                and confirm == "SELL"
+                and not fake
+            ):
+                entry = last['close']
+                sl = df['high'].iloc[-3]
+                tp = df['lower'].iloc[-1]
+                rr = round((entry - tp) / (sl - entry), 2)
+
+                reason = f"LTF: {trend_m1}/{trend_m5}/{trend_m15}\nHTF: {htf_confirm}\nBreakout+Retest confirmed"
+
+                if last_signal != "SELL":
+                    send_signal(f"📉 SELL\nEntry:{entry}\nSL:{sl}\nTP:{tp}\nRR:{rr}\n\n{reason}")
+                    last_signal = "SELL"
+
+    # EXIT
+    df = calculate_indicators(m15)
+    last = df.iloc[-1]
+
+    if last_signal == "BUY" and last['ema'] < last['sma']:
+        send_signal("⚠️ EXIT BUY\nEMA crossed down")
+        last_signal = None
+
+    elif last_signal == "SELL" and last['ema'] > last['sma']:
+        send_signal("⚠️ EXIT SELL\nEMA crossed up")
+        last_signal = None
+
+# ======================
+# LOOP
+# ======================
+while True:
+    try:
+        strategy("R_1000")
+        print("Running...")
+        time.sleep(60)
+    except Exception as e:
+        print("Error:", e)
+        time.sleep(30)
