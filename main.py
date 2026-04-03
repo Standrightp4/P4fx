@@ -36,7 +36,7 @@ def keep_alive():
 keep_alive()
 
 # ======================
-# GLOBAL SETTINGS
+# SETTINGS
 # ======================
 signal_history = []
 MAX_SIGNALS_PER_HOUR = 3
@@ -50,7 +50,7 @@ SYMBOLS = [
 ]
 
 # ======================
-# SAFE DATA FETCH
+# DATA (SAFE)
 # ======================
 def get_market_data(symbol, granularity):
     try:
@@ -179,8 +179,11 @@ def strategy(symbol):
     h4 = get_market_data(symbol, 14400)
     d1 = get_market_data(symbol, 86400)
 
-    # skip bad data
-    if None in [m1, m5, m15, h1, h4, d1]:
+    # ✅ FIXED DATAFRAME CHECK
+    if any(x is None for x in [m1, m5, m15, h1, h4, d1]):
+        return
+
+    if any(x.empty for x in [m1, m5, m15, h1, h4, d1]):
         return
 
     t1, t5, t15 = get_structure(m1), get_structure(m5), get_structure(m15)
