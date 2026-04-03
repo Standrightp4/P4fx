@@ -50,30 +50,39 @@ SYMBOLS = [
 ]
 
 # ======================
-# DATA (FIXED WEBSOCKET)
+# SAFE DATA FETCH
 # ======================
 def get_market_data(symbol, granularity):
-    ws = websocket.create_connection(
-        "wss://ws.derivws.com/websockets/v3?app_id=1089"
-    )
+    try:
+        ws = websocket.create_connection(
+            "wss://ws.derivws.com/websockets/v3?app_id=1089"
+        )
 
-    req = {
-        "ticks_history": symbol,
-        "adjust_start_time": 1,
-        "count": 100,
-        "end": "latest",
-        "granularity": granularity,
-        "style": "candles"
-    }
+        req = {
+            "ticks_history": symbol,
+            "adjust_start_time": 1,
+            "count": 100,
+            "end": "latest",
+            "granularity": granularity,
+            "style": "candles"
+        }
 
-    ws.send(json.dumps(req))
-    res = json.loads(ws.recv())
-    ws.close()
+        ws.send(json.dumps(req))
+        res = json.loads(ws.recv())
+        ws.close()
 
-    df = pd.DataFrame(res['candles'])
-    df[['open','close','high','low']] = df[['open','close','high','low']].astype(float)
+        if 'candles' not in res:
+            print(f"No candles for {symbol}")
+            return None
 
-    return df
+        df = pd.DataFrame(res['candles'])
+        df[['open','close','high','low']] = df[['open','close','high','low']].astype(float)
+
+        return df
+
+    except Exception as e:
+        print(f"Data error for {symbol}: {e}")
+        return None
 
 # ======================
 # INDICATORS
@@ -170,6 +179,10 @@ def strategy(symbol):
     h4 = get_market_data(symbol, 14400)
     d1 = get_market_data(symbol, 86400)
 
+    # skip bad data
+    if None in [m1, m5, m15, h1, h4, d1]:
+        return
+
     t1, t5, t15 = get_structure(m1), get_structure(m5), get_structure(m15)
     htf = [get_structure(h1), get_structure(h4), get_structure(d1)]
 
@@ -193,20 +206,18 @@ def strategy(symbol):
             entry = last['close']
             sl = df['low'].iloc[-3] if direction=="UP" else df['high'].iloc[-3]
             tp = df['upper'].iloc[-1] if direction=="UP" else df['lower'].iloc[-1]
-
             rr = round(abs(tp-entry)/abs(entry-sl),2)
 
             if confidence >= MIN_CONFIDENCE and can_send():
                 if last_signal.get(symbol) != direction:
                     signal_history.append(time.time())
 
-                    send_signal(f"""{'📈 BUY' if direction=='UP' else '📉 SELL'} ({symbol})
+                    send_signal(f"""{'BUY' if direction=='UP' else 'SELL'} ({symbol})
 
 Entry: {entry}
 SL: {sl}
 TP: {tp}
 RR: {rr}
-
 Confidence: {confidence}%
 
 LTF: {t1}/{t5}/{t15}
