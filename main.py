@@ -1,249 +1,195 @@
-import requests
-import pandas as pd
-import time
-import websocket
-import json
-import os
-from flask import Flask
-from threading import Thread
+import requests, pandas as pd, time, websocket, json, os, logging
+from datetime import datetime, timezone
+from sklearn.ensemble import RandomForestClassifier
 
-# ======================
-# TELEGRAM
-# ======================
+# ================= CONFIG =================
 TOKEN = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
+DERIV_TOKEN = os.getenv("DERIV_TOKEN")
 
-def send_signal(msg):
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
+SYMBOLS = ["R_10","R_25","R_50","R_75","R_100","BOOM1000","CRASH1000"]
 
-# ======================
-# KEEP ALIVE
-# ======================
-app = Flask('')
+MIN_CONFIDENCE = 75
+COOLDOWN = 900
 
-@app.route('/')
-def home():
-    return "Bot running"
+# Risk controls
+MAX_TRADES_PER_DAY = 10
+MAX_CONSECUTIVE_LOSSES = 3
+DAILY_LOSS_LIMIT = 10
 
-def run_web():
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port)
+trade_count = 0
+consecutive_losses = 0
+daily_loss = 0
+last_reset_day = None
 
-def keep_alive():
-    Thread(target=run_web).start()
-
-keep_alive()
-
-# ======================
-# SETTINGS
-# ======================
 signal_history = []
-MAX_SIGNALS_PER_HOUR = 3
-MIN_CONFIDENCE = 70
+last_signal = {}
+trade_history = []
 
-SYMBOLS = [
-    "R_10","R_25","R_50","R_75","R_100",
-    "BOOM1000","BOOM500","CRASH1000","CRASH500",
-    "JD10","JD25","JD50","JD75","JD100",
-    "STEPINDEX"
-]
+model = RandomForestClassifier()
 
-# ======================
-# DATA (SAFE)
-# ======================
-def get_market_data(symbol, granularity):
+logging.basicConfig(level=logging.INFO)
+
+# ================= TELEGRAM =================
+def send(msg):
     try:
-        ws = websocket.create_connection(
-            "wss://ws.derivws.com/websockets/v3?app_id=1089"
-        )
+        requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                      data={"chat_id": CHAT_ID, "text": msg})
+    except:
+        pass
 
-        req = {
+# ================= SESSION =================
+def session_ok():
+    h = datetime.now(timezone.utc).hour
+    return 7 <= h <= 21
+
+# ================= WEBSOCKET =================
+def ws_connect():
+    ws = websocket.create_connection("wss://ws.derivws.com/websockets/v3?app_id=1089")
+    ws.settimeout(5)
+    ws.send(json.dumps({"authorize": DERIV_TOKEN}))
+    ws.recv()
+    return ws
+
+# ================= DATA =================
+def get_data(ws, symbol, g):
+    try:
+        ws.send(json.dumps({
             "ticks_history": symbol,
-            "adjust_start_time": 1,
             "count": 100,
-            "end": "latest",
-            "granularity": granularity,
+            "granularity": g,
             "style": "candles"
-        }
-
-        ws.send(json.dumps(req))
+        }))
         res = json.loads(ws.recv())
-        ws.close()
-
-        if 'candles' not in res:
-            print(f"No candles for {symbol}")
-            return None
-
         df = pd.DataFrame(res['candles'])
         df[['open','close','high','low']] = df[['open','close','high','low']].astype(float)
-
         return df
-
-    except Exception as e:
-        print(f"Data error for {symbol}: {e}")
+    except:
         return None
 
-# ======================
-# INDICATORS
-# ======================
-def calculate_indicators(df):
+# ================= INDICATORS =================
+def indicators(df):
     df['ema'] = df['close'].ewm(span=10).mean()
     df['sma'] = df['close'].rolling(10).mean()
-    df['mbb'] = df['close'].rolling(20).mean()
     df['std'] = df['close'].rolling(20).std()
-    df['upper'] = df['mbb'] + (2 * df['std'])
-    df['lower'] = df['mbb'] - (2 * df['std'])
+    df['atr'] = df['high'].rolling(14).max() - df['low'].rolling(14).min()
     return df
 
-def get_slope(series):
-    return series.iloc[-1] - series.iloc[-2]
-
-# ======================
-# PRICE ACTION
-# ======================
-def get_structure(df):
-    if df['high'].iloc[-1] > df['high'].iloc[-2] and df['low'].iloc[-1] > df['low'].iloc[-2]:
+# ================= SMART MONEY =================
+def bos(df):
+    if df['close'].iloc[-1] > df['high'].iloc[-10:-2].max():
         return "UP"
-    elif df['high'].iloc[-1] < df['high'].iloc[-2] and df['low'].iloc[-1] < df['low'].iloc[-2]:
+    if df['close'].iloc[-1] < df['low'].iloc[-10:-2].min():
         return "DOWN"
-    return "RANGE"
+    return None
 
-def trendline_break(df):
-    rh = df['high'].iloc[-5:-1].max()
-    rl = df['low'].iloc[-5:-1].min()
-    lc = df['close'].iloc[-1]
+def sweep(df):
+    if df['high'].iloc[-1] > df['high'].iloc[-5:-1].max():
+        return True
+    if df['low'].iloc[-1] < df['low'].iloc[-5:-1].min():
+        return True
+    return False
 
-    if lc > rh: return "BREAK_UP"
-    elif lc < rl: return "BREAK_DOWN"
-    return "NONE"
+# ================= AI =================
+def features(df):
+    return {
+        "ema_slope": df['ema'].iloc[-1]-df['ema'].iloc[-2],
+        "sma_slope": df['sma'].iloc[-1]-df['sma'].iloc[-2],
+        "atr": df['atr'].iloc[-1],
+        "vol": df['std'].iloc[-1]
+    }
 
-def retest_zone(df):
-    rh = df['high'].iloc[-5:-1].max()
-    rl = df['low'].iloc[-5:-1].min()
-    lc = df['close'].iloc[-1]
+def ai_pass(df):
+    if len(trade_history) < 30:
+        return True
+    X = pd.DataFrame([features(df)])
+    prob = model.predict_proba(X)[0][1]
+    return prob > 0.65
 
-    if abs(lc - rh) < 0.2: return "RETEST_HIGH"
-    elif abs(lc - rl) < 0.2: return "RETEST_LOW"
-    return "NONE"
+# ================= RISK =================
+def reset_daily():
+    global trade_count, consecutive_losses, daily_loss, last_reset_day
+    today = datetime.utcnow().date()
+    if last_reset_day != today:
+        trade_count = 0
+        consecutive_losses = 0
+        daily_loss = 0
+        last_reset_day = today
 
-def confirmation_candle(df):
-    last = df.iloc[-1]
-    body = abs(last['close'] - last['open'])
-    rng = last['high'] - last['low']
+def risk_ok():
+    return (trade_count < MAX_TRADES_PER_DAY and
+            consecutive_losses < MAX_CONSECUTIVE_LOSSES and
+            daily_loss < DAILY_LOSS_LIMIT)
 
-    if body > rng * 0.6:
-        return "BUY" if last['close'] > last['open'] else "SELL"
-    return "NONE"
+# ================= TRADE =================
+def trade(ws, symbol, direction):
+    contract = "CALL" if direction=="BUY" else "PUT"
 
-def is_fakeout(df):
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-    return ((prev['close'] > prev['open'] and last['close'] < last['open']) or
-            (prev['close'] < prev['open'] and last['close'] > last['open']))
+    ws.send(json.dumps({
+        "proposal":1,"amount":1,"basis":"stake",
+        "contract_type":contract,"currency":"USD",
+        "duration":5,"duration_unit":"m","symbol":symbol
+    }))
+    res = json.loads(ws.recv())
 
-# ======================
-# CONFIDENCE
-# ======================
-def get_confidence(direction, ema_slope, sma_slope, mbb_slope, breakout, retest, confirm, fake, htf):
-    score = 0
-    if direction != "RANGE": score += 20
-    if (ema_slope > 0 and sma_slope > 0) or (ema_slope < 0 and sma_slope < 0):
-        score += 15
-    if "BREAK" in breakout: score += 15
-    if "RETEST" in retest: score += 15
-    if confirm in ["BUY","SELL"]: score += 15
-    score += htf * 5
-    if fake: score -= 20
-    return max(0, min(score, 100))
+    ws.send(json.dumps({"buy":res["proposal"]["id"],"price":1}))
+    return json.loads(ws.recv())
 
-def can_send():
-    global signal_history
+# ================= STRATEGY =================
+def strategy(ws, symbol):
+    global trade_count
+
+    if not session_ok(): return
+    if not risk_ok(): return
+
     now = time.time()
-    signal_history = [t for t in signal_history if now - t < 3600]
-    return len(signal_history) < MAX_SIGNALS_PER_HOUR
-
-# ======================
-# STRATEGY
-# ======================
-last_signal = {}
-
-def strategy(symbol):
-    global last_signal
-
-    m1 = get_market_data(symbol, 60)
-    m5 = get_market_data(symbol, 300)
-    m15 = get_market_data(symbol, 900)
-
-    h1 = get_market_data(symbol, 3600)
-    h4 = get_market_data(symbol, 14400)
-    d1 = get_market_data(symbol, 86400)
-
-    # ✅ FIXED DATAFRAME CHECK
-    if any(x is None for x in [m1, m5, m15, h1, h4, d1]):
+    if now - last_signal.get(symbol,0) < COOLDOWN:
         return
 
-    if any(x.empty for x in [m1, m5, m15, h1, h4, d1]):
+    df = get_data(ws, symbol, 900)
+    if df is None or df.empty: return
+
+    df = indicators(df)
+
+    if df['atr'].iloc[-1] < df['atr'].rolling(20).mean().iloc[-1]:
         return
 
-    t1, t5, t15 = get_structure(m1), get_structure(m5), get_structure(m15)
-    htf = [get_structure(h1), get_structure(h4), get_structure(d1)]
+    direction = bos(df)
+    if not direction: return
 
-    if t1 == t5 == t15 and t15 != "RANGE":
-        direction = t15
-        htf_confirm = htf.count(direction)
+    if not sweep(df): return
+    if not ai_pass(df): return
 
-        if htf_confirm >= 1:
-            df = calculate_indicators(m15)
-            last = df.iloc[-1]
+    entry = df['close'].iloc[-1]
+    sl = df['low'].iloc[-3] if direction=="UP" else df['high'].iloc[-3]
 
-            ema_s, sma_s, mbb_s = get_slope(df['ema']), get_slope(df['sma']), get_slope(df['mbb'])
+    if abs(entry-sl)==0: return
 
-            breakout = trendline_break(df)
-            retest = retest_zone(df)
-            confirm = confirmation_candle(df)
-            fake = is_fakeout(df)
+    send(f"{direction} {symbol} @ {entry}")
 
-            confidence = get_confidence(direction, ema_s, sma_s, mbb_s, breakout, retest, confirm, fake, htf_confirm)
+    result = trade(ws, symbol, "BUY" if direction=="UP" else "SELL")
 
-            entry = last['close']
-            sl = df['low'].iloc[-3] if direction=="UP" else df['high'].iloc[-3]
-            tp = df['upper'].iloc[-1] if direction=="UP" else df['lower'].iloc[-1]
-            rr = round(abs(tp-entry)/abs(entry-sl),2)
+    trade_count += 1
+    last_signal[symbol] = now
 
-            if confidence >= MIN_CONFIDENCE and can_send():
-                if last_signal.get(symbol) != direction:
-                    signal_history.append(time.time())
+# ================= MAIN =================
+def main():
+    while True:
+        try:
+            reset_daily()
+            ws = ws_connect()
 
-                    send_signal(f"""{'BUY' if direction=='UP' else 'SELL'} ({symbol})
+            for s in SYMBOLS:
+                strategy(ws, s)
+                time.sleep(1)
 
-Entry: {entry}
-SL: {sl}
-TP: {tp}
-RR: {rr}
-Confidence: {confidence}%
+            ws.close()
+            time.sleep(60)
 
-LTF: {t1}/{t5}/{t15}
-HTF confirm: {htf_confirm}
-Breakout: {breakout}
-Retest: {retest}
-""")
+        except Exception as e:
+            send(f"⚠️ ERROR: {e}")
+            time.sleep(10)
 
-                    last_signal[symbol] = direction
-
-# ======================
-# LOOP
-# ======================
-while True:
-    try:
-        for sym in SYMBOLS:
-            strategy(sym)
-            time.sleep(2)
-
-        print("Scanning market...")
-        time.sleep(60)
-
-    except Exception as e:
-        print("Error:", e)
-        time.sleep(30)
-
+# ================= RUN =================
+if __name__ == "__main__":
+    main()
