@@ -42,15 +42,22 @@ signal_history = []
 MAX_SIGNALS_PER_HOUR = 3
 MIN_CONFIDENCE = 70
 
-BOOM_CRASH = ["BOOM1000","BOOM500","CRASH1000","CRASH500"]
-VOLATILITY = ["R_10","R_25","R_50","R_75","R_100","JD10","JD25","JD50","JD75","JD100","STEPINDEX"]
+SYMBOLS = [
+    "R_10","R_25","R_50","R_75","R_100",
+    "BOOM1000","BOOM500","CRASH1000","CRASH500",
+    "JD10","JD25","JD50","JD75","JD100",
+    "STEPINDEX"
+]
 
 # ======================
-# DATA FETCH
+# DATA (SAFE)
 # ======================
 def get_market_data(symbol, granularity):
     try:
-        ws = websocket.create_connection("wss://ws.derivws.com/websockets/v3?app_id=1089")
+        ws = websocket.create_connection(
+            "wss://ws.derivws.com/websockets/v3?app_id=1089"
+        )
+
         req = {
             "ticks_history": symbol,
             "adjust_start_time": 1,
@@ -59,29 +66,42 @@ def get_market_data(symbol, granularity):
             "granularity": granularity,
             "style": "candles"
         }
+
         ws.send(json.dumps(req))
         res = json.loads(ws.recv())
         ws.close()
+
         if 'candles' not in res:
+            print(f"No candles for {symbol}")
             return None
+
         df = pd.DataFrame(res['candles'])
         df[['open','close','high','low']] = df[['open','close','high','low']].astype(float)
+
         return df
+
     except Exception as e:
-        print(f"Data error {symbol}: {e}")
+        print(f"Data error for {symbol}: {e}")
         return None
 
 # ======================
-# INDICATORS & STRUCTURE
+# INDICATORS
 # ======================
 def calculate_indicators(df):
     df['ema'] = df['close'].ewm(span=10).mean()
     df['sma'] = df['close'].rolling(10).mean()
+    df['mbb'] = df['close'].rolling(20).mean()
+    df['std'] = df['close'].rolling(20).std()
+    df['upper'] = df['mbb'] + (2 * df['std'])
+    df['lower'] = df['mbb'] - (2 * df['std'])
     return df
 
 def get_slope(series):
     return series.iloc[-1] - series.iloc[-2]
 
+# ======================
+# PRICE ACTION
+# ======================
 def get_structure(df):
     if df['high'].iloc[-1] > df['high'].iloc[-2] and df['low'].iloc[-1] > df['low'].iloc[-2]:
         return "UP"
@@ -93,14 +113,25 @@ def trendline_break(df):
     rh = df['high'].iloc[-5:-1].max()
     rl = df['low'].iloc[-5:-1].min()
     lc = df['close'].iloc[-1]
+
     if lc > rh: return "BREAK_UP"
     elif lc < rl: return "BREAK_DOWN"
+    return "NONE"
+
+def retest_zone(df):
+    rh = df['high'].iloc[-5:-1].max()
+    rl = df['low'].iloc[-5:-1].min()
+    lc = df['close'].iloc[-1]
+
+    if abs(lc - rh) < 0.2: return "RETEST_HIGH"
+    elif abs(lc - rl) < 0.2: return "RETEST_LOW"
     return "NONE"
 
 def confirmation_candle(df):
     last = df.iloc[-1]
     body = abs(last['close'] - last['open'])
     rng = last['high'] - last['low']
+
     if body > rng * 0.6:
         return "BUY" if last['close'] > last['open'] else "SELL"
     return "NONE"
@@ -112,92 +143,107 @@ def is_fakeout(df):
             (prev['close'] < prev['open'] and last['close'] > last['open']))
 
 # ======================
-# SIGNAL MANAGEMENT
+# CONFIDENCE
 # ======================
+def get_confidence(direction, ema_slope, sma_slope, mbb_slope, breakout, retest, confirm, fake, htf):
+    score = 0
+    if direction != "RANGE": score += 20
+    if (ema_slope > 0 and sma_slope > 0) or (ema_slope < 0 and sma_slope < 0):
+        score += 15
+    if "BREAK" in breakout: score += 15
+    if "RETEST" in retest: score += 15
+    if confirm in ["BUY","SELL"]: score += 15
+    score += htf * 5
+    if fake: score -= 20
+    return max(0, min(score, 100))
+
 def can_send():
     global signal_history
     now = time.time()
     signal_history = [t for t in signal_history if now - t < 3600]
     return len(signal_history) < MAX_SIGNALS_PER_HOUR
 
+# ======================
+# STRATEGY
+# ======================
 last_signal = {}
 
-# ======================
-# BFA SCALPING FOR BOOM/CRASH
-# ======================
-def bfa_strategy(symbol):
-    global last_signal
-    m1 = get_market_data(symbol, 60)
-    m5 = get_market_data(symbol, 300)
-    if any(x is None or x.empty for x in [m1, m5]):
-        return
-    df = calculate_indicators(m1)
-    last = df.iloc[-1]
-    ema_slope = get_slope(df['ema'])
-    confirm = confirmation_candle(df)
-    breakout = trendline_break(df)
-    fake = is_fakeout(df)
-    direction = "UP" if ema_slope > 0 else "DOWN"
-    confidence = 0
-    confidence += 20 if (ema_slope>0 and direction=="UP") or (ema_slope<0 and direction=="DOWN") else 0
-    confidence += 15 if "BREAK" in breakout else 0
-    confidence += 15 if confirm in ["BUY","SELL"] else 0
-    confidence -= 20 if fake else 0
-    confidence = max(0, min(confidence, 100))
-    if confidence >= MIN_CONFIDENCE and can_send():
-        if last_signal.get(symbol) != direction:
-            signal_history.append(time.time())
-            send_signal(f"{'BUY' if direction=='UP' else 'SELL'} ({symbol})\nEntry: {last['close']}\nConfidence: {confidence}%")
-            last_signal[symbol] = direction
-
-# ======================
-# MULTI-TIMEFRAME STRATEGY FOR OTHER INDICES
-# ======================
 def strategy(symbol):
     global last_signal
+
     m1 = get_market_data(symbol, 60)
     m5 = get_market_data(symbol, 300)
     m15 = get_market_data(symbol, 900)
-    if any(x is None or x.empty for x in [m1,m5,m15]):
+
+    h1 = get_market_data(symbol, 3600)
+    h4 = get_market_data(symbol, 14400)
+    d1 = get_market_data(symbol, 86400)
+
+    # ✅ FIXED DATAFRAME CHECK
+    if any(x is None for x in [m1, m5, m15, h1, h4, d1]):
         return
+
+    if any(x.empty for x in [m1, m5, m15, h1, h4, d1]):
+        return
+
     t1, t5, t15 = get_structure(m1), get_structure(m5), get_structure(m15)
+    htf = [get_structure(h1), get_structure(h4), get_structure(d1)]
+
     if t1 == t5 == t15 and t15 != "RANGE":
         direction = t15
-        df = calculate_indicators(m15)
-        last = df.iloc[-1]
-        ema_s = get_slope(df['ema'])
-        breakout = trendline_break(df)
-        confirm = confirmation_candle(df)
-        fake = is_fakeout(df)
-        confidence = 0
-        confidence += 20
-        confidence += 15 if (ema_s>0 and direction=="UP") or (ema_s<0 and direction=="DOWN") else 0
-        confidence += 15 if "BREAK" in breakout else 0
-        confidence += 15 if confirm in ["BUY","SELL"] else 0
-        confidence -= 20 if fake else 0
-        confidence = max(0, min(confidence,100))
-        if confidence >= MIN_CONFIDENCE and can_send():
-            if last_signal.get(symbol) != direction:
-                signal_history.append(time.time())
-                send_signal(f"{'BUY' if direction=='UP' else 'SELL'} ({symbol})\nEntry: {last['close']}\nConfidence: {confidence}%")
-                last_signal[symbol] = direction
+        htf_confirm = htf.count(direction)
+
+        if htf_confirm >= 1:
+            df = calculate_indicators(m15)
+            last = df.iloc[-1]
+
+            ema_s, sma_s, mbb_s = get_slope(df['ema']), get_slope(df['sma']), get_slope(df['mbb'])
+
+            breakout = trendline_break(df)
+            retest = retest_zone(df)
+            confirm = confirmation_candle(df)
+            fake = is_fakeout(df)
+
+            confidence = get_confidence(direction, ema_s, sma_s, mbb_s, breakout, retest, confirm, fake, htf_confirm)
+
+            entry = last['close']
+            sl = df['low'].iloc[-3] if direction=="UP" else df['high'].iloc[-3]
+            tp = df['upper'].iloc[-1] if direction=="UP" else df['lower'].iloc[-1]
+            rr = round(abs(tp-entry)/abs(entry-sl),2)
+
+            if confidence >= MIN_CONFIDENCE and can_send():
+                if last_signal.get(symbol) != direction:
+                    signal_history.append(time.time())
+
+                    send_signal(f"""{'BUY' if direction=='UP' else 'SELL'} ({symbol})
+
+Entry: {entry}
+SL: {sl}
+TP: {tp}
+RR: {rr}
+Confidence: {confidence}%
+
+LTF: {t1}/{t5}/{t15}
+HTF confirm: {htf_confirm}
+Breakout: {breakout}
+Retest: {retest}
+""")
+
+                    last_signal[symbol] = direction
 
 # ======================
-# MAIN LOOP
+# LOOP
 # ======================
 while True:
     try:
-        for sym in BOOM_CRASH:
-            bfa_strategy(sym)
-            time.sleep(1)
-
-        for sym in VOLATILITY:
+        for sym in SYMBOLS:
             strategy(sym)
             time.sleep(2)
 
-        print("Market scan complete...")
-        time.sleep(15)
+        print("Scanning market...")
+        time.sleep(60)
 
     except Exception as e:
         print("Error:", e)
-        time.sleep(5)
+        time.sleep(30)
+
