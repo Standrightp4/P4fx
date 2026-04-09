@@ -3,9 +3,9 @@ from datetime import datetime, timezone
 from sklearn.ensemble import RandomForestClassifier
 
 # ================= CONFIG =================
-TOKEN = os.getenv("TOKEN")         # Telegram bot token
-CHAT_ID = os.getenv("CHAT_ID")     # Telegram chat or group ID
-DERIV_TOKEN = os.getenv("DERIV_TOKEN")  # Deriv API token
+TOKEN = os.getenv("TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+DERIV_TOKEN = os.getenv("DERIV_TOKEN")
 
 COOLDOWN = 900
 MIN_DATA = 50
@@ -29,13 +29,21 @@ model = RandomForestClassifier()
 logging.basicConfig(level=logging.INFO)
 
 # ================= TELEGRAM =================
-if not TOKEN or not CHAT_ID:
-    logging.error("Telegram TOKEN or CHAT_ID not set! Please check environment variables.")
+def test_telegram():
+    if not TOKEN or not CHAT_ID:
+        raise RuntimeError("❌ Telegram TOKEN or CHAT_ID not set!")
+    try:
+        res = requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+            data={"chat_id": CHAT_ID, "text": "✅ Telegram test message"}
+        )
+        if res.status_code != 200:
+            raise RuntimeError(f"❌ Telegram failed: {res.status_code} {res.text}")
+        logging.info("✅ Telegram test message sent successfully")
+    except Exception as e:
+        raise RuntimeError(f"❌ Telegram test failed: {e}")
 
 def send(msg):
-    if not TOKEN or not CHAT_ID:
-        logging.warning(f"Telegram not configured. Message skipped: {msg}")
-        return
     try:
         res = requests.post(
             f"https://api.telegram.org/bot{TOKEN}/sendMessage",
@@ -62,7 +70,7 @@ def ws_connect():
             ws.send(json.dumps({"authorize": DERIV_TOKEN}))
             ws.recv()
             logging.info("Connected to Deriv")
-            send("Bot started ✅ Connected to Deriv")
+            send("🤖 Bot started and connected to Deriv")
             return ws
         except Exception as e:
             logging.error(f"WS connect failed: {e}")
@@ -176,13 +184,7 @@ def risk_ok():
 # ================= TRADE =================
 def trade(ws, symbol, direction):
     try:
-        if "BOOM" in symbol.upper():
-            contract = "CALL" if direction=="BUY" else "PUT"
-        elif "CRASH" in symbol.upper():
-            contract = "PUT" if direction=="BUY" else "CALL"
-        else:
-            contract = "CALL" if direction=="BUY" else "PUT"
-
+        contract = "CALL" if direction=="BUY" else "PUT"
         ws.send(json.dumps({
             "proposal":1,
             "amount":1,
@@ -267,9 +269,16 @@ def strategy(ws, symbol):
 
 # ================= MAIN =================
 def main():
+    try:
+        test_telegram()  # Validate Telegram before starting
+    except RuntimeError as e:
+        logging.error(e)
+        return
+
     ws = ws_connect()
     symbols = get_symbols(ws)
     send(f"Tracking {len(symbols)} symbols...")
+
     while True:
         try:
             reset_daily()
@@ -286,6 +295,5 @@ def main():
             send(f"⚠️ ERROR: {e}")
             time.sleep(5)
 
-# ================= RUN =================
 if __name__ == "__main__":
     main()
