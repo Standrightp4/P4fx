@@ -4,7 +4,7 @@ from sklearn.ensemble import RandomForestClassifier
 
 # ================= CONFIG =================
 TOKEN = os.getenv("TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
+CHAT_ID = os.getenv("CHAT_ID")  # Optional, will auto-fetch if not set
 DERIV_TOKEN = os.getenv("DERIV_TOKEN")
 
 COOLDOWN = 900
@@ -29,9 +29,32 @@ model = RandomForestClassifier()
 logging.basicConfig(level=logging.INFO)
 
 # ================= TELEGRAM =================
+def get_chat_id():
+    """
+    Automatically get CHAT_ID for your Telegram bot.
+    - Send a message to the bot from your Telegram account.
+    - This function fetches the latest chat_id from getUpdates.
+    """
+    if not TOKEN:
+        raise RuntimeError("❌ Telegram TOKEN not set!")
+
+    try:
+        res = requests.get(f"https://api.telegram.org/bot{TOKEN}/getUpdates").json()
+        if not res["ok"] or not res["result"]:
+            raise RuntimeError("❌ No messages found. Send a message to your bot first!")
+        # Take the chat ID from the last message
+        chat_id = res["result"][-1]["message"]["chat"]["id"]
+        logging.info(f"✅ Detected CHAT_ID: {chat_id}")
+        return str(chat_id)
+    except Exception as e:
+        raise RuntimeError(f"❌ Failed to fetch CHAT_ID: {e}")
+
 def test_telegram():
-    if not TOKEN or not CHAT_ID:
-        raise RuntimeError("❌ Telegram TOKEN or CHAT_ID not set!")
+    global CHAT_ID
+    if not TOKEN:
+        raise RuntimeError("❌ Telegram TOKEN not set!")
+    if not CHAT_ID:
+        CHAT_ID = get_chat_id()  # Auto-fetch if not set
     try:
         res = requests.post(
             f"https://api.telegram.org/bot{TOKEN}/sendMessage",
