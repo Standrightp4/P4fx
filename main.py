@@ -3,9 +3,9 @@ from datetime import datetime, timezone
 from sklearn.ensemble import RandomForestClassifier
 
 # ================= CONFIG =================
-TOKEN = os.getenv("TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
-DERIV_TOKEN = os.getenv("DERIV_TOKEN")
+TOKEN = os.getenv("TOKEN")         # Telegram bot token
+CHAT_ID = os.getenv("CHAT_ID")     # Telegram chat or group ID
+DERIV_TOKEN = os.getenv("DERIV_TOKEN")  # Deriv API token
 
 COOLDOWN = 900
 MIN_DATA = 50
@@ -29,14 +29,24 @@ model = RandomForestClassifier()
 logging.basicConfig(level=logging.INFO)
 
 # ================= TELEGRAM =================
+if not TOKEN or not CHAT_ID:
+    logging.error("Telegram TOKEN or CHAT_ID not set! Please check environment variables.")
+
 def send(msg):
+    if not TOKEN or not CHAT_ID:
+        logging.warning(f"Telegram not configured. Message skipped: {msg}")
+        return
     try:
-        requests.post(
+        res = requests.post(
             f"https://api.telegram.org/bot{TOKEN}/sendMessage",
             data={"chat_id": CHAT_ID, "text": msg}
         )
-    except:
-        pass
+        if res.status_code != 200:
+            logging.error(f"Telegram send failed: {res.status_code} {res.text}")
+        else:
+            logging.info(f"Telegram message sent: {msg}")
+    except Exception as e:
+        logging.error(f"Exception sending Telegram message: {e}")
 
 # ================= SESSION =================
 def session_ok():
@@ -48,12 +58,14 @@ def ws_connect():
     while True:
         try:
             ws = websocket.create_connection("wss://ws.derivws.com/websockets/v3?app_id=1089")
-            ws.settimeout(5)
+            ws.settimeout(10)
             ws.send(json.dumps({"authorize": DERIV_TOKEN}))
             ws.recv()
             logging.info("Connected to Deriv")
+            send("Bot started ✅ Connected to Deriv")
             return ws
-        except:
+        except Exception as e:
+            logging.error(f"WS connect failed: {e}")
             time.sleep(5)
 
 # ================= SYMBOLS =================
@@ -62,10 +74,11 @@ def get_symbols(ws):
         ws.send(json.dumps({"active_symbols": "full"}))
         res = json.loads(ws.recv())
         return [
-            s["symbol"] for s in res["active_symbols"]
-            if s["exchange_is_open"] and s["is_trading_suspended"] == 0
+            s["symbol"] for s in res.get("active_symbols", [])
+            if s.get("exchange_is_open", True) and s.get("is_trading_suspended", 0) == 0
         ]
-    except:
+    except Exception as e:
+        logging.error(f"Failed to fetch symbols: {e}")
         return []
 
 # ================= DATA =================
@@ -73,23 +86,22 @@ def get_data(ws, symbol):
     try:
         ws.send(json.dumps({
             "ticks_history": symbol,
+            "adjust_start_time": 1,
+            "end": "latest",
             "count": 100,
-            "granularity": 900,
+            "granularity": 60,
             "style": "candles"
         }))
         res = json.loads(ws.recv())
-
         if "candles" not in res:
             return None
-
         df = pd.DataFrame(res['candles'])
         df[['open','close','high','low']] = df[['open','close','high','low']].astype(float)
-
         if len(df) < MIN_DATA:
             return None
-
         return df
-    except:
+    except Exception as e:
+        logging.error(f"Failed to get data for {symbol}: {e}")
         return None
 
 # ================= INDICATORS =================
@@ -131,19 +143,20 @@ def features(df):
     }
 
 def ai_pass(df):
+    if not hasattr(model, "classes_"):
+        return True
     try:
         X = pd.DataFrame([features(df)])
         prob = model.predict_proba(X)[0][1]
         return prob > 0.6
-    except:
+    except Exception as e:
+        logging.error(f"AI pass error: {e}")
         return True
 
 # ================= RISK =================
 def reset_daily():
     global trade_count, wins, losses, consecutive_losses, daily_loss, last_reset_day
-
     today = datetime.now(timezone.utc).date()
-
     if last_reset_day != today:
         trade_count = 0
         wins = 0
@@ -151,6 +164,7 @@ def reset_daily():
         consecutive_losses = 0
         daily_loss = 0
         last_reset_day = today
+        send("🔄 Daily reset completed")
 
 def risk_ok():
     return (
@@ -162,7 +176,12 @@ def risk_ok():
 # ================= TRADE =================
 def trade(ws, symbol, direction):
     try:
-        contract = "CALL" if direction == "BUY" else "PUT"
+        if "BOOM" in symbol.upper():
+            contract = "CALL" if direction=="BUY" else "PUT"
+        elif "CRASH" in symbol.upper():
+            contract = "PUT" if direction=="BUY" else "CALL"
+        else:
+            contract = "CALL" if direction=="BUY" else "PUT"
 
         ws.send(json.dumps({
             "proposal":1,
@@ -175,25 +194,21 @@ def trade(ws, symbol, direction):
             "symbol":symbol
         }))
         res = json.loads(ws.recv())
-
         proposal_id = res["proposal"]["id"]
-
         ws.send(json.dumps({"buy":proposal_id,"price":1}))
         buy_res = json.loads(ws.recv())
-
         contract_id = buy_res["buy"]["contract_id"]
         open_contracts[contract_id] = symbol
-
+        send(f"🟢 Trade executed: {direction} {symbol} (Contract {contract_id})")
         return contract_id
-
     except Exception as e:
         logging.error(f"Trade error: {e}")
+        send(f"⚠️ Trade error for {symbol}: {e}")
         return None
 
 # ================= RESULT TRACKING =================
 def check_results(ws):
     global wins, losses, consecutive_losses, daily_loss
-
     for contract_id in list(open_contracts.keys()):
         try:
             ws.send(json.dumps({
@@ -201,15 +216,11 @@ def check_results(ws):
                 "contract_id": contract_id
             }))
             res = json.loads(ws.recv())
-
             if "proposal_open_contract" not in res:
                 continue
-
             poc = res["proposal_open_contract"]
-
-            if poc["is_sold"]:
-                profit = poc["profit"]
-
+            if poc.get("is_sold", False):
+                profit = float(poc.get("profit", 0))
                 if profit > 0:
                     wins += 1
                     consecutive_losses = 0
@@ -217,84 +228,63 @@ def check_results(ws):
                     losses += 1
                     consecutive_losses += 1
                     daily_loss += abs(profit)
-
                 del open_contracts[contract_id]
-
                 total = wins + losses
                 winrate = (wins / total * 100) if total > 0 else 0
-
                 send(f"📊 WR: {winrate:.1f}% | W:{wins} L:{losses}")
-
-        except:
-            continue
+        except Exception as e:
+            logging.error(f"Check result error: {e}")
 
 # ================= STRATEGY =================
 def strategy(ws, symbol):
     global trade_count
-
     if not session_ok() or not risk_ok():
         return
-
     now = time.time()
-
     if now - last_signal.get(symbol, 0) < COOLDOWN:
         return
-
     df = get_data(ws, symbol)
     if df is None:
         return
-
     df = indicators(df)
-
     if df['atr'].iloc[-1] < df['atr'].rolling(20).mean().iloc[-1]:
         return
-
     direction = bos(df)
     if not direction:
         return
-
     if not sweep(df):
         return
-
     if not spike(df):
         return
-
     if not ai_pass(df):
         return
-
     entry = df['close'].iloc[-1]
-
-    send(f"{direction} {symbol} @ {entry}")
-
+    send(f"📈 Signal: {direction} {symbol} @ {entry}")
     contract_id = trade(ws, symbol, direction)
-
     if contract_id:
         trade_count += 1
         last_signal[symbol] = now
 
 # ================= MAIN =================
 def main():
+    ws = ws_connect()
+    symbols = get_symbols(ws)
+    send(f"Tracking {len(symbols)} symbols...")
     while True:
         try:
-            logging.info("Bot running...")
-
             reset_daily()
-            ws = ws_connect()
-
-            symbols = get_symbols(ws)
-
             for s in symbols:
                 strategy(ws, s)
                 check_results(ws)
                 time.sleep(0.5)
-
-            ws.close()
-            time.sleep(60)
-
+        except websocket.WebSocketConnectionClosedException:
+            logging.warning("WebSocket disconnected. Reconnecting...")
+            ws = ws_connect()
+            symbols = get_symbols(ws)
         except Exception as e:
-            logging.error(e)
+            logging.error(f"Main loop error: {e}")
             send(f"⚠️ ERROR: {e}")
-            time.sleep(10)
+            time.sleep(5)
 
 # ================= RUN =================
 if __name__ == "__main__":
