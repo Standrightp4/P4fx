@@ -7,22 +7,19 @@ TOKEN = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 DERIV_TOKEN = os.getenv("DERIV_TOKEN")
 
-SYMBOLS = ["R_10","R_25","R_50","R_75","R_100","BOOM1000","CRASH1000"]
-
-MIN_CONFIDENCE = 75
 COOLDOWN = 900
+MIN_DATA = 50
 
 # Risk controls
-MAX_TRADES_PER_DAY = 10
+MAX_TRADES_PER_DAY = 15
 MAX_CONSECUTIVE_LOSSES = 3
-DAILY_LOSS_LIMIT = 10
+DAILY_LOSS_LIMIT = 15
 
 trade_count = 0
 consecutive_losses = 0
 daily_loss = 0
 last_reset_day = None
 
-signal_history = []
 last_signal = {}
 trade_history = []
 
@@ -43,7 +40,7 @@ def send(msg):
 # ================= SESSION =================
 def session_ok():
     h = datetime.now(timezone.utc).hour
-    return 7 <= h <= 21
+    return 6 <= h <= 22
 
 # ================= WEBSOCKET =================
 def ws_connect():
@@ -53,13 +50,26 @@ def ws_connect():
     ws.recv()
     return ws
 
+# ================= GET SYMBOLS =================
+def get_symbols(ws):
+    ws.send(json.dumps({"active_symbols": "full"}))
+    res = json.loads(ws.recv())
+
+    symbols = []
+
+    for s in res["active_symbols"]:
+        if s["exchange_is_open"] and s["is_trading_suspended"] == 0:
+            symbols.append(s["symbol"])
+
+    return symbols
+
 # ================= DATA =================
-def get_data(ws, symbol, g):
+def get_data(ws, symbol):
     try:
         ws.send(json.dumps({
             "ticks_history": symbol,
             "count": 100,
-            "granularity": g,
+            "granularity": 900,
             "style": "candles"
         }))
         res = json.loads(ws.recv())
@@ -70,9 +80,11 @@ def get_data(ws, symbol, g):
         df = pd.DataFrame(res['candles'])
         df[['open','close','high','low']] = df[['open','close','high','low']].astype(float)
 
+        if len(df) < MIN_DATA:
+            return None
+
         return df
-    except Exception as e:
-        logging.error(f"Data error: {e}")
+    except:
         return None
 
 # ================= INDICATORS =================
@@ -83,20 +95,28 @@ def indicators(df):
     df['atr'] = df['high'].rolling(14).max() - df['low'].rolling(14).min()
     return df
 
+# ================= MARKET TYPE =================
+def market_type(symbol):
+    if "BOOM" in symbol or "CRASH" in symbol:
+        return "BOOMCRASH"
+    elif symbol.startswith("R_"):
+        return "SYNTH"
+    else:
+        return "FOREX"
+
 # ================= SMART MONEY =================
 def bos(df):
     if df['close'].iloc[-1] > df['high'].iloc[-10:-2].max():
-        return "UP"
+        return "BUY"
     if df['close'].iloc[-1] < df['low'].iloc[-10:-2].min():
-        return "DOWN"
+        return "SELL"
     return None
 
 def sweep(df):
-    if df['high'].iloc[-1] > df['high'].iloc[-5:-1].max():
-        return True
-    if df['low'].iloc[-1] < df['low'].iloc[-5:-1].min():
-        return True
-    return False
+    return (
+        df['high'].iloc[-1] > df['high'].iloc[-5:-1].max() or
+        df['low'].iloc[-1] < df['low'].iloc[-5:-1].min()
+    )
 
 # ================= AI =================
 def features(df):
@@ -114,15 +134,15 @@ def ai_pass(df):
     try:
         X = pd.DataFrame([features(df)])
         prob = model.predict_proba(X)[0][1]
-        return prob > 0.65
-    except Exception:
-        return True  # fallback if model not trained
+        return prob > 0.6
+    except:
+        return True
 
 # ================= RISK =================
 def reset_daily():
     global trade_count, consecutive_losses, daily_loss, last_reset_day
 
-    today = datetime.now(timezone.utc).date()  # ✅ FIXED
+    today = datetime.now(timezone.utc).date()
 
     if last_reset_day != today:
         trade_count = 0
@@ -142,41 +162,38 @@ def trade(ws, symbol, direction):
     contract = "CALL" if direction == "BUY" else "PUT"
 
     ws.send(json.dumps({
-        "proposal": 1,
-        "amount": 1,
-        "basis": "stake",
-        "contract_type": contract,
-        "currency": "USD",
-        "duration": 5,
-        "duration_unit": "m",
-        "symbol": symbol
+        "proposal":1,
+        "amount":1,
+        "basis":"stake",
+        "contract_type":contract,
+        "currency":"USD",
+        "duration":5,
+        "duration_unit":"m",
+        "symbol":symbol
     }))
     res = json.loads(ws.recv())
 
-    ws.send(json.dumps({"buy": res["proposal"]["id"], "price": 1}))
+    ws.send(json.dumps({"buy":res["proposal"]["id"],"price":1}))
     return json.loads(ws.recv())
 
 # ================= STRATEGY =================
 def strategy(ws, symbol):
     global trade_count
 
-    if not session_ok():
-        return
-
-    if not risk_ok():
+    if not session_ok() or not risk_ok():
         return
 
     now = time.time()
-
     if now - last_signal.get(symbol, 0) < COOLDOWN:
         return
 
-    df = get_data(ws, symbol, 900)
-    if df is None or df.empty:
+    df = get_data(ws, symbol)
+    if df is None:
         return
 
     df = indicators(df)
 
+    # volatility filter (adaptive)
     if df['atr'].iloc[-1] < df['atr'].rolling(20).mean().iloc[-1]:
         return
 
@@ -191,14 +208,10 @@ def strategy(ws, symbol):
         return
 
     entry = df['close'].iloc[-1]
-    sl = df['low'].iloc[-3] if direction == "UP" else df['high'].iloc[-3]
-
-    if abs(entry - sl) == 0:
-        return
 
     send(f"{direction} {symbol} @ {entry}")
 
-    trade(ws, symbol, "BUY" if direction == "UP" else "SELL")
+    trade(ws, symbol, direction)
 
     trade_count += 1
     last_signal[symbol] = now
@@ -210,9 +223,12 @@ def main():
             reset_daily()
             ws = ws_connect()
 
-            for s in SYMBOLS:
+            symbols = get_symbols(ws)
+            logging.info(f"Scanning {len(symbols)} symbols...")
+
+            for s in symbols:
                 strategy(ws, s)
-                time.sleep(1)
+                time.sleep(0.5)
 
             ws.close()
             time.sleep(60)
