@@ -33,10 +33,12 @@ logging.basicConfig(level=logging.INFO)
 # ================= TELEGRAM =================
 def send(msg):
     try:
-        requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-                      data={"chat_id": CHAT_ID, "text": msg})
-    except:
-        pass
+        requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+            data={"chat_id": CHAT_ID, "text": msg}
+        )
+    except Exception as e:
+        logging.error(f"Telegram error: {e}")
 
 # ================= SESSION =================
 def session_ok():
@@ -61,10 +63,16 @@ def get_data(ws, symbol, g):
             "style": "candles"
         }))
         res = json.loads(ws.recv())
+
+        if "candles" not in res:
+            return None
+
         df = pd.DataFrame(res['candles'])
         df[['open','close','high','low']] = df[['open','close','high','low']].astype(float)
+
         return df
-    except:
+    except Exception as e:
+        logging.error(f"Data error: {e}")
         return None
 
 # ================= INDICATORS =================
@@ -93,8 +101,8 @@ def sweep(df):
 # ================= AI =================
 def features(df):
     return {
-        "ema_slope": df['ema'].iloc[-1]-df['ema'].iloc[-2],
-        "sma_slope": df['sma'].iloc[-1]-df['sma'].iloc[-2],
+        "ema_slope": df['ema'].iloc[-1] - df['ema'].iloc[-2],
+        "sma_slope": df['sma'].iloc[-1] - df['sma'].iloc[-2],
         "atr": df['atr'].iloc[-1],
         "vol": df['std'].iloc[-1]
     }
@@ -102,14 +110,20 @@ def features(df):
 def ai_pass(df):
     if len(trade_history) < 30:
         return True
-    X = pd.DataFrame([features(df)])
-    prob = model.predict_proba(X)[0][1]
-    return prob > 0.65
+
+    try:
+        X = pd.DataFrame([features(df)])
+        prob = model.predict_proba(X)[0][1]
+        return prob > 0.65
+    except Exception:
+        return True  # fallback if model not trained
 
 # ================= RISK =================
 def reset_daily():
     global trade_count, consecutive_losses, daily_loss, last_reset_day
-    today = datetime.utcnow().date()
+
+    today = datetime.now(timezone.utc).date()  # ✅ FIXED
+
     if last_reset_day != today:
         trade_count = 0
         consecutive_losses = 0
@@ -117,37 +131,49 @@ def reset_daily():
         last_reset_day = today
 
 def risk_ok():
-    return (trade_count < MAX_TRADES_PER_DAY and
-            consecutive_losses < MAX_CONSECUTIVE_LOSSES and
-            daily_loss < DAILY_LOSS_LIMIT)
+    return (
+        trade_count < MAX_TRADES_PER_DAY and
+        consecutive_losses < MAX_CONSECUTIVE_LOSSES and
+        daily_loss < DAILY_LOSS_LIMIT
+    )
 
 # ================= TRADE =================
 def trade(ws, symbol, direction):
-    contract = "CALL" if direction=="BUY" else "PUT"
+    contract = "CALL" if direction == "BUY" else "PUT"
 
     ws.send(json.dumps({
-        "proposal":1,"amount":1,"basis":"stake",
-        "contract_type":contract,"currency":"USD",
-        "duration":5,"duration_unit":"m","symbol":symbol
+        "proposal": 1,
+        "amount": 1,
+        "basis": "stake",
+        "contract_type": contract,
+        "currency": "USD",
+        "duration": 5,
+        "duration_unit": "m",
+        "symbol": symbol
     }))
     res = json.loads(ws.recv())
 
-    ws.send(json.dumps({"buy":res["proposal"]["id"],"price":1}))
+    ws.send(json.dumps({"buy": res["proposal"]["id"], "price": 1}))
     return json.loads(ws.recv())
 
 # ================= STRATEGY =================
 def strategy(ws, symbol):
     global trade_count
 
-    if not session_ok(): return
-    if not risk_ok(): return
+    if not session_ok():
+        return
+
+    if not risk_ok():
+        return
 
     now = time.time()
-    if now - last_signal.get(symbol,0) < COOLDOWN:
+
+    if now - last_signal.get(symbol, 0) < COOLDOWN:
         return
 
     df = get_data(ws, symbol, 900)
-    if df is None or df.empty: return
+    if df is None or df.empty:
+        return
 
     df = indicators(df)
 
@@ -155,19 +181,24 @@ def strategy(ws, symbol):
         return
 
     direction = bos(df)
-    if not direction: return
+    if not direction:
+        return
 
-    if not sweep(df): return
-    if not ai_pass(df): return
+    if not sweep(df):
+        return
+
+    if not ai_pass(df):
+        return
 
     entry = df['close'].iloc[-1]
-    sl = df['low'].iloc[-3] if direction=="UP" else df['high'].iloc[-3]
+    sl = df['low'].iloc[-3] if direction == "UP" else df['high'].iloc[-3]
 
-    if abs(entry-sl)==0: return
+    if abs(entry - sl) == 0:
+        return
 
     send(f"{direction} {symbol} @ {entry}")
 
-    result = trade(ws, symbol, "BUY" if direction=="UP" else "SELL")
+    trade(ws, symbol, "BUY" if direction == "UP" else "SELL")
 
     trade_count += 1
     last_signal[symbol] = now
